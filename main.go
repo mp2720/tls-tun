@@ -456,15 +456,31 @@ func main() {
 
 	ifaceName := flag.Arg(0)
 	ifaceAddr := flag.Arg(1)
-
-	iface, err := water.New(water.Config{
+	
+	tunNameFile := os.Getenv("TUN_NAME")
+	
+	cfg := water.Config{
 		DeviceType: water.TUN,
-		PlatformSpecificParams: water.PlatformSpecificParams{
+	}
+	
+	if tunNameFile == "" {
+		// Preserve existing behavior on platforms that support naming.
+		cfg.PlatformSpecificParams = water.PlatformSpecificParams{
 			Name: ifaceName,
-		},
-	})
+		}
+	}
+	
+	iface, err := water.New(cfg)
 	if err != nil {
 		log.Fatalf("Failed to create TUN: %s", err)
+	}
+	
+	realIfaceName := iface.Name()
+	
+	if tunNameFile != "" {
+		if err := os.WriteFile(tunNameFile, []byte(realIfaceName), 0644); err != nil {
+			log.Fatalf("Failed to write TUN interface name: %v", err)
+		}
 	}
 
 	if err := ipLog("link", "set", "up", "dev", ifaceName); err != nil {

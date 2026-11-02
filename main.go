@@ -1,26 +1,32 @@
 package main
 
 import (
+	"crypto/tls"
 	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"math"
+	"net/netip"
 	"os"
+	"strings"
 
 	"github.com/songgao/water"
 )
 
 func usage() {
-	fmt.Fprintf(os.Stderr, "Usage\n")
-	fmt.Fprintf(os.Stderr, "  server:\n")
-	fmt.Fprintf(os.Stderr, "    %s listen [--fwmark <fwmark>] [--server-key <key path> --server-cert <cert path> --client-cert <cert path>] <bind address> <interface>\n", os.Args[0])
-	fmt.Fprintf(os.Stderr, "\n")
-	fmt.Fprintf(os.Stderr, "  client:\n")
-	fmt.Fprintf(os.Stderr, "    %s connect [--fwmark <fwmark>] [--client-key <key path> --client-cert <cert path> --server-cert <cert path>] <server address> <interface>\n", os.Args[0])
-	fmt.Fprintf(os.Stderr, "\n")
-	fmt.Fprintf(os.Stderr, "Key & certs flags should either be all specified (thus enabling TLS mode) or omitted for plaintext TCP.\n")
-	fmt.Fprintf(os.Stderr, "Firewall mark is set for socket iff the --fwmark flag is specified.\n")
+	msgFmt := `Usage
+  server:
+    %[1]s listen [--fwmark <fwmark>] [--server-key <server key path> --server-cert <server cert path> --client-cert <client cert path>] [--whitelist <addr1:port,addr2:port,...> --fallback-proxy-to <target address>] <bind address> <interface>
+
+  client:
+    %[1]s connect [--fwmark <fwmark>] [--client-key <client key path> --client-cert <client cert path> --server-cert <server cert path>] <server address> <interface>
+
+Key & certs flags should either be all specified (thus enabling TLS mode) or omitted for plaintext TCP.
+Firewall mark is set for socket iff the --fwmark flag is specified.
+If whitelist (comma separated list of address:port pairs) is specified, so should be the fallback reverse proxy target address. Any non-whitelisted inbound connection will be TCP-proxied to the target address. Zero port matches all ports.
+`
+	fmt.Fprintf(os.Stderr, msgFmt, os.Args[0])
 }
 
 func createTUN(name string) (*water.Interface, error) {
@@ -32,16 +38,32 @@ func createTUN(name string) (*water.Interface, error) {
 	})
 }
 
+func parseWhitelist(s string) (map[netip.AddrPort]struct{}, error) {
+	addrs := make(map[netip.AddrPort]struct{})
+	for _, strAddr := range strings.Split(s, ",") {
+		addr, err := netip.ParseAddrPort(strings.TrimSpace(strAddr))
+		if err != nil {
+			return nil, fmt.Errorf("Invalid address %q: %w", strAddr, err)
+		}
+		addrs[addr] = struct{}{}
+	}
+	return addrs, nil
+}
+
 func newServerFromArgs(args []string) (*Server, error) {
 	var (
 		serverKeyPath  string
 		serverCertPath string
 		clientCertPath string
+		whitelist      string
+		proxyTarget    string
 	)
 	fs := flag.NewFlagSet("listen", flag.ExitOnError)
 	fs.StringVar(&serverKeyPath, "server-key", "", "Path to the server key file")
 	fs.StringVar(&serverCertPath, "server-cert", "", "Path to the server cert file")
 	fs.StringVar(&clientCertPath, "client-cert", "", "Path to the client cert file")
+	fs.StringVar(&whitelist, "whitelist", "", "Comma separated array of allowed addresses for inbound connections")
+	fs.StringVar(&proxyTarget, "fallback-proxy-to", "", "Fallback proxy target address")
 	fs.Usage = usage
 	if err := fs.Parse(args); err != nil {
 		return nil, err
@@ -50,13 +72,20 @@ func newServerFromArgs(args []string) (*Server, error) {
 		return nil, errors.New("Invalid use: bind address and interface must be provided")
 	}
 
-	var secure bool
-	if serverKeyPath == "" && serverCertPath == "" && clientCertPath == "" {
-		secure = false
-	} else if serverKeyPath != "" && serverCertPath != "" && clientCertPath != "" {
-		secure = true
-	} else {
+	var tlsCfg *tls.Config
+	if serverKeyPath != "" && serverCertPath != "" && clientCertPath != "" {
+		var err error
+		tlsCfg, err = LoadServerTLSConfig(serverKeyPath, serverCertPath, clientCertPath)
+		if err != nil {
+			return nil, fmt.Errorf("Failed to load tls certs or key: %w", err)
+		}
+	} else if !(serverKeyPath == "" && serverCertPath == "" && clientCertPath == "") {
 		return nil, errors.New("Invalid use: either all key/cert flags should be set or none of them")
+	}
+
+	parsedWhitelist, err := parseWhitelist(whitelist)
+	if err != nil {
+		return nil, fmt.Errorf("Cannot parse whitelist: %w", err)
 	}
 
 	addr := fs.Arg(0)
@@ -68,12 +97,11 @@ func newServerFromArgs(args []string) (*Server, error) {
 	}
 
 	server := Server{
-		BindAddr:       addr,
-		Secure:         secure,
-		ServerCertPath: serverCertPath,
-		ServerKeyPath:  serverKeyPath,
-		ClientCertPath: clientCertPath,
-		Iface:          iface,
+		BindAddr:        addr,
+		TLSCfg:          tlsCfg,
+		Iface:           iface,
+		WhiteList:       parsedWhitelist,
+		ProxyTargetAddr: proxyTarget,
 	}
 	return &server, nil
 }
@@ -98,12 +126,14 @@ func newClientFromArgs(args []string) (*Client, error) {
 		return nil, errors.New("Invalid use: server address and interface must be provided")
 	}
 
-	var secure bool
-	if clientKeyPath == "" && clientCertPath == "" && serverCertPath == "" {
-		secure = false
-	} else if clientKeyPath != "" && clientCertPath != "" && serverCertPath != "" {
-		secure = true
-	} else {
+	var tlsCfg *tls.Config
+	if clientKeyPath != "" && clientCertPath != "" && serverCertPath != "" {
+		var err error
+		tlsCfg, err = LoadClientTLSConfig(clientKeyPath, clientCertPath, serverCertPath)
+		if err != nil {
+			return nil, fmt.Errorf("Failed to load tls certs or key: %w", err)
+		}
+	} else if !(clientKeyPath == "" && clientCertPath == "" && serverCertPath == "") {
 		return nil, errors.New("Invalid use: either all key/cert flags should be set or none of them")
 	}
 
@@ -120,12 +150,10 @@ func newClientFromArgs(args []string) (*Client, error) {
 	}
 
 	client := Client{
-		ServerAddr:     addr,
-		Secure:         secure,
-		ClientCertPath: clientCertPath,
-		ClientKeyPath:  clientKeyPath,
-		ServerCertPath: serverCertPath,
-		Iface:          iface,
+		ServerAddr:  addr,
+		TLSCfg:      tlsCfg,
+		Fwmark:      uint32(fwmark),
+		Iface:       iface,
 	}
 	return &client, nil
 }

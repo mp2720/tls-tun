@@ -16,38 +16,25 @@ import (
 )
 
 type Client struct {
-	Secure         bool
-	ServerAddr     string
-	ClientCertPath string
-	ClientKeyPath  string
-	ServerCertPath string
-	Fwmark         uint32
-	Iface          *water.Interface
+	ServerAddr string
+	TLSCfg     *tls.Config
+	Fwmark     uint32
+	Iface      *water.Interface
 }
 
 func (c *Client) Run() error {
-	var (
-		conn    net.Conn
-		rawConn syscall.RawConn
-	)
-	if c.Secure {
-		var err error
-		conn, rawConn, err = dialTLS(c.ClientKeyPath, c.ClientCertPath, c.ServerCertPath, c.ServerAddr)
-		if err != nil {
-			return fmt.Errorf("Failed to dial plaintext TCP: %w", err)
-		}
-		defer conn.Close()
-	} else {
-		log.Printf("WARNING: dialing plaintext TCP")
-		var err error
-		conn, rawConn, err = dial(c.ServerAddr)
-		if err != nil {
-			return fmt.Errorf("Failed to dial plaintext TCP: %w", err)
-		}
-		defer conn.Close()
+	conn, rawConn, err := dial(c.ServerAddr)
+	if err != nil {
+		return fmt.Errorf("Failed to dial server: %w", err)
 	}
-
+	defer conn.Close()
 	log.Printf("Connected to server")
+
+	if c.TLSCfg != nil {
+		conn = tls.Client(conn, c.TLSCfg)
+	} else {
+		log.Printf("WARN: using plaintext TCP")
+	}
 
 	if c.Fwmark != 0 {
 		err := setFwmark(rawConn, uint32(c.Fwmark))
@@ -91,39 +78,25 @@ func dial(remoteAddr string) (net.Conn, syscall.RawConn, error) {
 	return tcpConn, rawConn, nil
 }
 
-func dialTLS(
+func LoadClientTLSConfig(
 	clientKeyPath string,
 	clientCertPath string,
 	serverCertPath string,
-	remoteAddr string,
-) (net.Conn, syscall.RawConn, error) {
+) (*tls.Config, error) {
 	clientCert, err := tls.LoadX509KeyPair(clientCertPath, clientKeyPath)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	serverCertBytes, err := os.ReadFile(serverCertPath)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	serverCertPool := x509.NewCertPool()
 	if !serverCertPool.AppendCertsFromPEM(serverCertBytes) {
-		return nil, nil, errors.New("failed to load server cert")
+		return nil, errors.New("failed to load server cert")
 	}
-
-	cfg := tls.Config{
+	return &tls.Config{
 		Certificates: []tls.Certificate{clientCert},
 		RootCAs:      serverCertPool,
-	}
-
-	tlsConn, err := tls.Dial("tcp", remoteAddr, &cfg)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	rawConn, err := tlsConn.NetConn().(*net.TCPConn).SyscallConn()
-	if err != nil {
-		return nil, nil, err
-	}
-
-	return tlsConn, rawConn, nil
+	}, nil
 }

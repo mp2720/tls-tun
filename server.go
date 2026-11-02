@@ -4,41 +4,31 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
-	"fmt"
 	"log"
 	"net"
+	"net/netip"
 	"os"
 
 	"github.com/songgao/water"
 )
 
 type Server struct {
-	BindAddr       string
-	Secure         bool
-	ServerCertPath string
-	ServerKeyPath  string
-	ClientCertPath string
-	Iface          *water.Interface
+	BindAddr        string
+	TLSCfg          *tls.Config
+	Iface           *water.Interface
+	WhiteList       map[netip.AddrPort]struct{}
+	ProxyTargetAddr string
 }
 
 func (s *Server) Run() error {
-	var listener net.Listener
-	if s.Secure {
-		var err error
-		listener, err = listenTLS(s.ServerKeyPath, s.ServerCertPath, s.ClientCertPath, s.BindAddr)
-		if err != nil {
-			return fmt.Errorf("Failed to listen TLS: %w", err)
-		}
-		defer listener.Close()
-		log.Printf("Listening for TLS on %s", s.BindAddr)
-	} else {
-		var err error
-		listener, err = listen(s.BindAddr)
-		if err != nil {
-			return fmt.Errorf("Failed to listen plaintext TCP: %w", err)
-		}
-		defer listener.Close()
-		log.Printf("WARNING: Listening for plaintext TCP on %s", s.BindAddr)
+	listener, err := net.Listen("tcp", s.BindAddr)
+	if err != nil {
+		return err
+	}
+	defer listener.Close()
+	log.Printf("Listening on %s", s.BindAddr)
+	if s.TLSCfg == nil {
+		log.Print("WARN: Accepting plaintext TCP connections")
 	}
 
 	var (
@@ -51,26 +41,53 @@ func (s *Server) Run() error {
 			log.Printf("Failed to accept: %s", err)
 			continue
 		}
-		log.Printf("Accepted %s", conn.RemoteAddr())
 
-		go sender(nil, clientNo, s.Iface, conn)
-		go receiver(nil, clientNo, s.Iface, conn, prevConn)
+		allowed := filterTCPAddr(conn.RemoteAddr(), s.WhiteList)
+		if allowed {
+			log.Printf("Accepted client %d from %s (whitelisted)", clientNo, conn.RemoteAddr())
 
-		prevConn = conn
+			if s.TLSCfg != nil {
+				conn = tls.Client(conn, s.TLSCfg)
+			}
+
+			go sender(nil, clientNo, s.Iface, conn)
+			go receiver(nil, clientNo, s.Iface, conn, prevConn)
+
+			prevConn = conn
+		} else {
+			log.Printf("Accepted client %d from %s: not in whitelist, serving as proxy", clientNo, conn.RemoteAddr())
+			go ReverseProxyRoutine(clientNo, conn, s.ProxyTargetAddr)
+		}
+
 		clientNo++
 	}
 }
 
-func listen(bind string) (net.Listener, error) {
-	return net.Listen("tcp", bind)
+func filterTCPAddr(addr net.Addr, whitelist map[netip.AddrPort]struct{}) (allowed bool) {
+	if len(whitelist) == 0 {
+		return true
+	}
+
+	tcpAddr, ok := addr.(*net.TCPAddr)
+	if !ok {
+		log.Printf("Remote address is not TCPAddr (!?)")
+		return false
+	}
+
+	_, ok = whitelist[tcpAddr.AddrPort()]
+	if ok {
+		return true
+	}
+
+	_, ok = whitelist[netip.AddrPortFrom(tcpAddr.AddrPort().Addr(), 0)]
+	return ok
 }
 
-func listenTLS(
+func LoadServerTLSConfig(
 	serverKeyPath string,
 	serverCertPath string,
 	clientCertPath string,
-	bind string,
-) (net.Listener, error) {
+) (*tls.Config, error) {
 	servCert, err := tls.LoadX509KeyPair(serverCertPath, serverKeyPath)
 	if err != nil {
 		return nil, err
@@ -84,12 +101,9 @@ func listenTLS(
 		err = errors.New("failed to load client cert")
 		return nil, err
 	}
-
-	cfg := tls.Config{
+	return &tls.Config{
 		Certificates: []tls.Certificate{servCert},
 		ClientAuth:   tls.RequireAndVerifyClientCert,
 		ClientCAs:    clientCertPool,
-	}
-
-	return tls.Listen("tcp", bind, &cfg)
+	}, nil
 }

@@ -8,18 +8,6 @@ import (
 	"time"
 )
 
-func writeAll(wr io.Writer, buf []byte) error {
-	offset := 0
-	for offset < len(buf) {
-		written, err := wr.Write(buf[offset:])
-		if err != nil {
-			return err
-		}
-		offset += written
-	}
-	return nil
-}
-
 func sender(wg *sync.WaitGroup, no int, iface io.Reader, wr io.WriteCloser) {
 	if wg != nil {
 		defer wg.Done()
@@ -49,18 +37,6 @@ func sender(wg *sync.WaitGroup, no int, iface io.Reader, wr io.WriteCloser) {
 	}
 }
 
-func readAll(rd io.Reader, buf []byte) error {
-	offset := 0
-	for offset < len(buf) {
-		bytesRead, err := rd.Read(buf[offset:])
-		if err != nil {
-			return err
-		}
-		offset += bytesRead
-	}
-	return nil
-}
-
 func receiver(wg *sync.WaitGroup, no int, iface io.Writer, conn net.Conn, prevConn io.Closer) {
 	if wg != nil {
 		defer wg.Done()
@@ -88,7 +64,7 @@ func receiver(wg *sync.WaitGroup, no int, iface io.Writer, conn net.Conn, prevCo
 		if err := prevConn.Close(); err != nil {
 			log.Printf("receiver %d: Failed to close the previous client socket: %s", no, err)
 		} else {
-			log.Printf("receiver %d: Close the previous client socket: %s", no, err)
+			log.Printf("receiver %d: Closed the previous client socket: %s", no, err)
 		}
 	}
 
